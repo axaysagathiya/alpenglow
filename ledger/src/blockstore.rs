@@ -101,7 +101,7 @@ pub use {
         blockstore::error::{BlockstoreError, Result},
         blockstore_db::{default_num_compaction_threads, default_num_flush_threads},
         blockstore_meta::{OptimisticSlotMetaVersioned, SlotMeta},
-        blockstore_metrics::BlockstoreInsertionMetrics,
+        blockstore_metrics::{BlockstoreInsertionMetrics, BlockstoreSwitchBankMetrics},
     },
     blockstore_purge::PurgeType,
     rocksdb::properties as RocksProperties,
@@ -2019,17 +2019,28 @@ impl Blockstore {
             "Cannot switch from Original location"
         );
 
+        let mut metrics = BlockstoreSwitchBankMetrics::default();
+
+        let mut total_measure = Measure::start("switch_block_from_alternate_total");
+
+        let mut lock_measure = Measure::start("switch_block_from_alternate_lock");
         let lock = self.insert_shreds_lock.lock().unwrap();
+        lock_measure.stop();
+        metrics.lock_elapsed_us = lock_measure.as_us();
 
         // 1. Backup the original block if needed
+        let mut backup_measure = Measure::start("switch_block_from_alternate_backup");
         if let Some(dmr) = self.get_double_merkle_root(slot, BlockLocation::Original) {
             let backup_location = BlockLocation::Alternate { block_id: dmr };
             if self.get_double_merkle_root(slot, backup_location).is_none() {
                 self.copy_shreds_locked(&lock, slot, BlockLocation::Original, backup_location);
             }
         }
+        backup_measure.stop();
+        metrics.backup_elapsed_us = backup_measure.as_us();
 
         // 2. Purge the original column data, keeping alternate columns intact
+        let mut purge_measure = Measure::start("switch_block_from_alternate_purge");
         match self.purge_slot_cleanup_chaining_keep_alt(slot) {
             Ok(_) => {}
             Err(BlockstoreError::SlotUnavailable) => {
@@ -2037,8 +2048,11 @@ impl Blockstore {
             }
             Err(e) => panic!("Purge database operations failed: {e}"),
         }
+        purge_measure.stop();
+        metrics.purge_elapsed_us = purge_measure.as_us();
 
         // 3. Copy shreds from alternate location to original
+        let mut copy_measure = Measure::start("switch_block_from_alternate_copy");
         let alt_meta = self
             .meta_from_location(slot, from_location)
             .expect("Blockstore operations must succeed")
@@ -2046,6 +2060,8 @@ impl Blockstore {
         assert!(alt_meta.is_full(), "Alternate slot must be full");
 
         self.copy_shreds_locked(&lock, slot, from_location, BlockLocation::Original);
+        copy_measure.stop();
+        metrics.copy_elapsed_us = copy_measure.as_us();
 
         // 4. Verify the switch was successful
         assert!(
@@ -2055,6 +2071,10 @@ impl Blockstore {
                 .is_full(),
             "Slot must be full after switch"
         );
+        total_measure.stop();
+        metrics.total_elapsed_us = total_measure.as_us();
+
+        metrics.report_metrics(slot);
     }
 
     // Bypasses erasure recovery becuase it is called from broadcast stage

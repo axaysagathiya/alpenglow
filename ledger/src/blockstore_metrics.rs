@@ -6,6 +6,7 @@ use {
     },
     solana_metrics::datapoint_info,
     solana_time_utils::timestamp,
+    solana_clock::Slot,
     std::{
         cell::RefCell,
         fmt::Debug,
@@ -40,6 +41,29 @@ pub struct BlockstoreInsertionMetrics {
     pub num_coding_shreds_invalid: usize,
     pub num_coding_shreds_invalid_erasure_config: usize,
     pub num_coding_shreds_inserted: usize,
+}
+
+#[derive(Default)]
+pub struct BlockstoreSwitchBankMetrics {
+    pub total_elapsed_us: u64,
+    pub lock_elapsed_us: u64,
+    pub backup_elapsed_us: u64,
+    pub purge_elapsed_us: u64,
+    pub copy_elapsed_us: u64,
+}
+
+impl BlockstoreSwitchBankMetrics {
+    pub fn report_metrics(&self, slot: Slot) {
+        datapoint_info!(
+            "blockstore_switch_block",
+            ("slot", slot as i64, i64),
+            ("total_elapsed_us", self.total_elapsed_us as i64, i64),
+            ("lock_elapsed_us", self.lock_elapsed_us as i64, i64),
+            ("backup_elapsed_us", self.backup_elapsed_us as i64, i64),
+            ("purge_elapsed_us", self.purge_elapsed_us as i64, i64),
+            ("copy_elapsed_us", self.copy_elapsed_us as i64, i64),
+        );
+    }
 }
 
 impl BlockstoreInsertionMetrics {

@@ -2179,6 +2179,9 @@ impl ReplayStage {
             }
         };
 
+        let mut did_switch = false;
+        let mut process_switch_bank_events_measure =
+            Measure::start("process_switch_bank_events_measure");
         *pending_switch = pending_switch.filter(|(slot, block_id)| {
             if bank_forks.read().unwrap().block_id(*slot) == Some(*block_id) {
                 // Nothing to switch
@@ -2252,11 +2255,24 @@ impl ReplayStage {
 
                 // Switch the blockstore data atomically, handles slot meta chaining so generate new bank forks can proceed
                 blockstore.switch_block_from_alternate(slot, location);
+                did_switch = true;
                 info!("{my_pubkey}: Switched {slot} from {location:?}");
             }
 
             false
         });
+
+        process_switch_bank_events_measure.stop();
+        if did_switch {
+            datapoint_info!(
+                "replay_stage-process_switch_bank_events",
+                (
+                    "duration_us",
+                    process_switch_bank_events_measure.as_us() as i64,
+                    i64
+                ),
+            );
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
