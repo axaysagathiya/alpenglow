@@ -15,7 +15,7 @@ use {
     crossbeam_channel::{Sender, TrySendError},
     rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator},
     solana_bls_signatures::{
-        pubkey::{Pubkey as BlsPubkey, PubkeyProjective, VerifiablePubkey},
+        pubkey::{PubkeyAffine as BlsPubkeyAffine, PubkeyProjective, VerifiablePubkey},
         signature::SignatureProjective,
         BlsError,
     },
@@ -32,7 +32,7 @@ use {
 #[derive(Clone, Debug)]
 pub(super) struct VoteToVerify {
     pub vote_message: VoteMessage,
-    pub bls_pubkey: BlsPubkey,
+    pub bls_pubkey: BlsPubkeyAffine,
     pub pubkey: Pubkey,
 }
 
@@ -341,7 +341,7 @@ fn aggregate_pubkeys_by_payload(
     votes: &[VoteToVerify],
     stats: &mut SigVerifyVoteStats,
 ) -> (Vec<Vec<u8>>, Result<Vec<PubkeyProjective>, BlsError>) {
-    let mut grouped_votes: HashMap<&Vote, Vec<&BlsPubkey>> = HashMap::new();
+    let mut grouped_votes: HashMap<&Vote, Vec<&BlsPubkeyAffine>> = HashMap::new();
 
     for v in votes {
         grouped_votes
@@ -360,9 +360,7 @@ fn aggregate_pubkeys_by_payload(
         .map(|(vote, pubkeys)| {
             (
                 get_vote_payload(vote),
-                // TODO(sam): https://github.com/anza-xyz/alpenglow/issues/708
-                // should improve public key aggregation drastically (more than 80%)
-                PubkeyProjective::par_aggregate(pubkeys.into_par_iter()),
+                PubkeyProjective::aggregate(pubkeys.into_iter()),
             )
         })
         .unzip();
