@@ -15,7 +15,7 @@ use {
     crossbeam_channel::{Sender, TrySendError},
     rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator},
     solana_bls_signatures::{
-        pubkey::{Pubkey as BlsPubkey, PubkeyProjective, VerifiablePubkey},
+        pubkey::{PubkeyAffine as BlsPubkeyAffine, PubkeyProjective, VerifiablePubkey},
         signature::SignatureProjective,
         BlsError,
     },
@@ -32,7 +32,7 @@ use {
 #[derive(Clone, Debug)]
 pub(super) struct VoteToVerify {
     pub vote_message: VoteMessage,
-    pub bls_pubkey: BlsPubkey,
+    pub bls_pubkey: BlsPubkeyAffine,
     pub pubkey: Pubkey,
 }
 
@@ -284,6 +284,9 @@ fn verify_votes_optimistic(
     //
     // By verifying the aggregated signature against the aggregated public keys,
     // the number of pairings required is reduced to (1 + number of distinct messages).
+    //
+    // Assuming that sigverifier's dedicated thread pool was used to call this function, the
+    // following should run on that thread pool.
     let (signature_result, (distinct_payloads, pubkeys_result)) = rayon::join(
         || aggregate_signatures(votes_to_verify),
         || aggregate_pubkeys_by_payload(votes_to_verify, stats),
@@ -306,7 +309,11 @@ fn verify_votes_optimistic(
     } else {
         // if non-unique payload, we need to apply a pairing for each distinct message,
         // which is done inside `par_verify_distinct_aggregated`.
-        let payload_slices: Vec<&[u8]> = distinct_payloads.iter().map(|p| p.as_slice()).collect();
+        //
+        // Assuming that sigverifier's dedicated thread pool was used to call this function, the
+        // following should run on that thread pool.
+        let payload_slices: Vec<&[u8]> =
+            distinct_payloads.par_iter().map(|p| p.as_slice()).collect();
         SignatureProjective::par_verify_distinct_aggregated(
             &aggregate_pubkeys,
             &aggregate_signature,
@@ -323,6 +330,8 @@ fn verify_votes_optimistic(
     verified
 }
 
+// Assuming that sigverifier's dedicated thread pool was used to call this function, the
+// following should run on that thread pool.
 #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
 fn aggregate_signatures(votes: &[VoteToVerify]) -> Result<SignatureProjective, BlsError> {
     let signatures = votes.par_iter().map(|v| &v.vote_message.signature);
@@ -341,7 +350,7 @@ fn aggregate_pubkeys_by_payload(
     votes: &[VoteToVerify],
     stats: &mut SigVerifyVoteStats,
 ) -> (Vec<Vec<u8>>, Result<Vec<PubkeyProjective>, BlsError>) {
-    let mut grouped_votes: HashMap<&Vote, Vec<&BlsPubkey>> = HashMap::new();
+    let mut grouped_votes: HashMap<&Vote, Vec<&BlsPubkeyAffine>> = HashMap::new();
 
     for v in votes {
         grouped_votes
@@ -355,14 +364,14 @@ fn aggregate_pubkeys_by_payload(
         .increment(grouped_votes.len() as u64)
         .unwrap();
 
+    // Assuming that sigverifier's dedicated thread pool was used to call this function, the
+    // following should run on that thread pool.
     let (distinct_payloads, distinct_pubkeys_results): (Vec<_>, Vec<_>) = grouped_votes
         .into_par_iter()
         .map(|(vote, pubkeys)| {
             (
                 get_vote_payload(vote),
-                // TODO(sam): https://github.com/anza-xyz/alpenglow/issues/708
-                // should improve public key aggregation drastically (more than 80%)
-                PubkeyProjective::par_aggregate(pubkeys.into_par_iter()),
+                PubkeyProjective::aggregate(pubkeys.into_iter()),
             )
         })
         .unzip();
@@ -378,6 +387,8 @@ fn verify_individual_votes(
 ) -> Vec<VoteToVerify> {
     let mut measure = Measure::start("verify_individual_votes");
 
+    // Assuming that sigverifier's dedicated thread pool was used to call this function, the
+    // following should run on that thread pool.
     let verified_votes: Vec<VoteToVerify> = votes_to_verify
         .into_par_iter()
         .filter_map(|vote| vote.verify().then_some(vote))
