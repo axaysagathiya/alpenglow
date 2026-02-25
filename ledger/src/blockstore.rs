@@ -47,7 +47,7 @@ use {
     solana_genesis_config::{GenesisConfig, DEFAULT_GENESIS_ARCHIVE, DEFAULT_GENESIS_FILE},
     solana_hash::Hash,
     solana_keypair::Keypair,
-    solana_measure::measure::Measure,
+    solana_measure::{measure::Measure, measure_us},
     solana_metrics::datapoint_error,
     solana_pubkey::Pubkey,
     solana_runtime::bank::Bank,
@@ -2023,10 +2023,8 @@ impl Blockstore {
 
         let mut total_measure = Measure::start("switch_block_from_alternate_total");
 
-        let mut lock_measure = Measure::start("switch_block_from_alternate_lock");
-        let lock = self.insert_shreds_lock.lock().unwrap();
-        lock_measure.stop();
-        metrics.lock_elapsed_us = lock_measure.as_us();
+        let (lock, lock_time_us) = measure_us!(self.insert_shreds_lock.lock().unwrap());
+        metrics.lock_elapsed_us = lock_time_us;
 
         // 1. Backup the original block if needed
         let mut backup_measure = Measure::start("switch_block_from_alternate_backup");

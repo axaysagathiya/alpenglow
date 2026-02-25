@@ -55,7 +55,7 @@ pub struct BlockstoreSwitchBankMetrics {
 impl BlockstoreSwitchBankMetrics {
     pub fn report_metrics(&self, slot: Slot) {
         datapoint_info!(
-            "blockstore_switch_block",
+            "blockstore_switch_bank",
             ("slot", slot as i64, i64),
             ("total_elapsed_us", self.total_elapsed_us as i64, i64),
             ("lock_elapsed_us", self.lock_elapsed_us as i64, i64),
