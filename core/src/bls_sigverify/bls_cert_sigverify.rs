@@ -1,165 +1,154 @@
 use {
-    super::stats::BLSSigVerifierStats,
+    super::{errors::SigVerifyCertError, stats::SigVerifyCertStats},
     agave_bls_cert_verify::cert_verify::Error as BlsCertVerifyError,
-    crossbeam_channel::{Sender, TrySendError},
-    rayon::iter::{IntoParallelIterator, ParallelIterator},
-    solana_clock::Slot,
-    solana_measure::measure::Measure,
-    solana_runtime::bank::Bank,
-    solana_votor_messages::{
+    agave_votor_messages::{
         consensus_message::{Certificate, CertificateType, ConsensusMessage},
         fraction::Fraction,
     },
-    std::{
-        collections::HashSet,
-        num::NonZeroU64,
-        sync::{atomic::Ordering, RwLock},
-    },
+    crossbeam_channel::{unbounded, Sender, TrySendError},
+    rayon::iter::{IntoParallelIterator, ParallelIterator},
+    solana_measure::measure::Measure,
+    solana_runtime::bank::Bank,
+    std::{collections::HashSet, num::NonZeroU64},
     thiserror::Error,
 };
-
-#[derive(Debug, Error)]
-pub(super) enum Error {
-    #[error("channel to consensus pool disconnected")]
-    ConsensusPoolChannelDisconnected,
-}
-
 #[derive(Debug, Error)]
 enum CertVerifyError {
-    #[error("Failed to find key to rank map for slot {0}")]
-    KeyToRankMapNotFound(Slot),
-
-    #[error("Cert Verification Error {0:?}")]
+    #[error("Cert Verification Error {0}")]
     CertVerifyFailed(#[from] BlsCertVerifyError),
-
-    #[error("Not enough stake {0}: {1} < {2}")]
-    NotEnoughStake(u64, Fraction, Fraction),
+    #[error("Not enough stake {aggregate_stake}: {cert_fraction} < {required_fraction}")]
+    NotEnoughStake {
+        aggregate_stake: u64,
+        cert_fraction: Fraction,
+        required_fraction: Fraction,
+    },
 }
 
+/// Verifies certs and sends the verified certs to the consensus pool.
+///
+/// Additionally inserts valid [`CertificateType`]s into [`verified_certs_sets`].
+///
+/// Function expects that the caller has already deduped the certs to verify i.e.
+/// none of the certs appear in the [`verified_certs_set`].
 pub(super) fn verify_and_send_certificates(
-    certs_buffer: &mut Vec<Certificate>,
+    verified_certs_set: &mut HashSet<CertificateType>,
+    certs: Vec<Certificate>,
     bank: &Bank,
-    verified_certs: &RwLock<HashSet<CertificateType>>,
-    stats: &BLSSigVerifierStats,
     channel_to_pool: &Sender<Vec<ConsensusMessage>>,
-) -> Result<(), Error> {
-    let results = verify_certificates(certs_buffer, bank, verified_certs, stats);
+) -> Result<SigVerifyCertStats, SigVerifyCertError> {
+    for cert in certs.iter() {
+        debug_assert!(!verified_certs_set.contains(&cert.cert_type));
+    }
+    let mut measure = Measure::start("verify_and_send_certificates");
+    let mut stats = SigVerifyCertStats::default();
 
-    let valid_count = results.iter().filter(|&&valid| valid).count();
-    stats
-        .total_valid_packets
-        .fetch_add(valid_count as u64, Ordering::Relaxed);
-
-    let certs = certs_buffer
-        .drain(..)
-        .zip(results)
-        .filter_map(|(cert, is_valid)| is_valid.then_some(ConsensusMessage::Certificate(cert)))
-        .collect::<Vec<_>>();
-    let len = certs.len();
-    if len == 0 {
-        return Ok(());
+    if certs.is_empty() {
+        return Ok(stats);
     }
 
-    match channel_to_pool.try_send(certs) {
+    stats.certs_to_sig_verify += certs.len() as u64;
+    let messages = verify_certs(verified_certs_set, certs, bank, &mut stats);
+    stats.sig_verified_certs += messages.len() as u64;
+    send_certs_to_pool(messages, channel_to_pool, &mut stats)?;
+
+    measure.stop();
+    stats
+        .fn_verify_and_send_certs_stats
+        .increment(measure.as_us())
+        .unwrap();
+    Ok(stats)
+}
+
+/// Verifies certs.
+///
+/// The valid certs are inserted into the [`verified_certs_set`].
+/// Returns a Vec of [`ConsensusMessage`] constructed from the valid certs.
+fn verify_certs(
+    verified_certs_set: &mut HashSet<CertificateType>,
+    certs: Vec<Certificate>,
+    bank: &Bank,
+    stats: &mut SigVerifyCertStats,
+) -> Vec<ConsensusMessage> {
+    // We want to verify the certs in parallel however collecting them and inserting them into the
+    // set has to happen sequentially.  Following allows us to do that while minimising the number
+    // of times we have to iterate over the list of certs.
+
+    let (tx, rx) = unbounded();
+    rayon::scope(|s| {
+        s.spawn(|_| {
+            certs.into_par_iter().for_each_with(tx, |tx, cert| {
+                tx.send((verify_cert(&cert, bank), cert)).unwrap()
+            })
+        })
+    });
+    rx.into_iter()
+        .filter_map(|(res, cert)| match res {
+            Ok(()) => {
+                verified_certs_set.insert(cert.cert_type);
+                Some(ConsensusMessage::Certificate(cert))
+            }
+            Err(e) => match e {
+                CertVerifyError::NotEnoughStake { .. } => {
+                    stats.stake_verification_failed += 1;
+                    None
+                }
+                CertVerifyError::CertVerifyFailed(e) => match e {
+                    BlsCertVerifyError::MissingRankMap => None,
+                    _ => {
+                        stats.signature_verification_failed += 1;
+                        None
+                    }
+                },
+            },
+        })
+        .collect()
+}
+
+fn send_certs_to_pool(
+    messages: Vec<ConsensusMessage>,
+    channel_to_pool: &Sender<Vec<ConsensusMessage>>,
+    stats: &mut SigVerifyCertStats,
+) -> Result<(), SigVerifyCertError> {
+    if messages.is_empty() {
+        return Ok(());
+    }
+    let len = messages.len();
+    match channel_to_pool.try_send(messages) {
         Ok(()) => {
-            stats
-                .verify_certs_consensus_sent
-                .fetch_add(len as u64, Ordering::Relaxed);
+            stats.pool_sent += len as u64;
+            Ok(())
         }
         Err(TrySendError::Full(_)) => {
-            stats
-                .verify_certs_consensus_channel_full
-                .fetch_add(1, Ordering::Relaxed);
+            stats.pool_channel_full += 1;
+            Ok(())
         }
         Err(TrySendError::Disconnected(_)) => {
-            return Err(Error::ConsensusPoolChannelDisconnected);
+            Err(SigVerifyCertError::ConsensusPoolChannelDisconnected)
         }
     }
-    Ok(())
 }
 
-fn verify_certificates(
-    certs_to_verify: &[Certificate],
-    bank: &Bank,
-    verified_certs: &RwLock<HashSet<CertificateType>>,
-    stats: &BLSSigVerifierStats,
-) -> Vec<bool> {
-    if certs_to_verify.is_empty() {
-        return vec![];
-    }
-    stats.certs_batch_count.fetch_add(1, Ordering::Relaxed);
-    let mut certs_batch_verify_time = Measure::start("certs_batch_verify");
-
-    let verified_results: Vec<bool> = certs_to_verify
-        .into_par_iter()
-        .map(|cert_to_verify| {
-            match verify_bls_certificate(cert_to_verify, bank, verified_certs, stats) {
-                Ok(()) => true,
-                Err(e) => {
-                    trace!(
-                        "Failed to verify BLS certificate: {:?}, error: {e}",
-                        cert_to_verify.cert_type
-                    );
-                    if let CertVerifyError::NotEnoughStake(..) = e {
-                        stats
-                            .received_not_enough_stake
-                            .fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        stats
-                            .received_bad_signature_certs
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                    false
-                }
-            }
-        })
-        .collect();
-
-    certs_batch_verify_time.stop();
-    stats
-        .certs_batch_elapsed_us
-        .fetch_add(certs_batch_verify_time.as_us(), Ordering::Relaxed);
-    verified_results
+fn verify_cert(cert: &Certificate, bank: &Bank) -> Result<(), CertVerifyError> {
+    let (aggregate_stake, total_stake) = bank.verify_certificate(cert)?;
+    debug_assert!(aggregate_stake <= total_stake);
+    verify_stake(cert, aggregate_stake, total_stake)
 }
 
-fn verify_bls_certificate(
-    cert_to_verify: &Certificate,
-    bank: &Bank,
-    verified_certs: &RwLock<HashSet<CertificateType>>,
-    stats: &BLSSigVerifierStats,
+fn verify_stake(
+    cert: &Certificate,
+    aggregate_stake: u64,
+    total_stake: u64,
 ) -> Result<(), CertVerifyError> {
-    if verified_certs
-        .read()
-        .unwrap()
-        .contains(&cert_to_verify.cert_type)
-    {
-        stats.received_verified.fetch_add(1, Ordering::Relaxed);
-        return Ok(());
-    }
-
-    let slot = cert_to_verify.cert_type.slot();
-    let (aggregate_stake, total_stake) = bank.verify_certificate(cert_to_verify).map_err(|e| {
-        if matches!(e, BlsCertVerifyError::MissingRankMap) {
-            CertVerifyError::KeyToRankMapNotFound(slot)
-        } else {
-            CertVerifyError::CertVerifyFailed(e)
-        }
-    })?;
-
-    let (required_stake_fraction, _) = cert_to_verify.cert_type.limits_and_vote_types();
-    let my_fraction = Fraction::new(aggregate_stake, NonZeroU64::new(total_stake).unwrap());
-    if my_fraction < required_stake_fraction {
-        return Err(CertVerifyError::NotEnoughStake(
+    let (required_fraction, _) = cert.cert_type.limits_and_vote_types();
+    let total_stake = NonZeroU64::new(total_stake).expect("Total stake cannot be zero");
+    let cert_fraction = Fraction::new(aggregate_stake, total_stake);
+    if cert_fraction >= required_fraction {
+        Ok(())
+    } else {
+        Err(CertVerifyError::NotEnoughStake {
             aggregate_stake,
-            my_fraction,
-            required_stake_fraction,
-        ));
+            cert_fraction,
+            required_fraction,
+        })
     }
-
-    verified_certs
-        .write()
-        .unwrap()
-        .insert(cert_to_verify.cert_type);
-
-    Ok(())
 }

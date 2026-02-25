@@ -1,13 +1,21 @@
 #[cfg(feature = "dev-context-only-utils")]
 use qualifier_attr::qualifiers;
 use {
-    crate::{
-        bls_sigverify::stats::BLSSigVerifierStats, cluster_info_vote_listener::VerifiedVoteSender,
+    super::{errors::SigVerifyVoteError, stats::SigVerifyVoteStats},
+    crate::cluster_info_vote_listener::VerifiedVoteSender,
+    agave_votor::{
+        consensus_metrics::{ConsensusMetricsEvent, ConsensusMetricsEventSender},
+        consensus_rewards,
+    },
+    agave_votor_messages::{
+        consensus_message::{ConsensusMessage, VoteMessage},
+        reward_certificate::AddVoteMessage,
+        vote::Vote,
     },
     crossbeam_channel::{Sender, TrySendError},
     rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator},
     solana_bls_signatures::{
-        pubkey::{Pubkey as BlsPubkey, PubkeyProjective, VerifiablePubkey},
+        pubkey::{PubkeyAffine as BlsPubkeyAffine, PubkeyProjective, VerifiablePubkey},
         signature::SignatureProjective,
         BlsError,
     },
@@ -17,37 +25,14 @@ use {
     solana_measure::measure::Measure,
     solana_pubkey::Pubkey,
     solana_runtime::bank::Bank,
-    solana_votor::{
-        consensus_metrics::{ConsensusMetricsEvent, ConsensusMetricsEventSender},
-        consensus_rewards,
-    },
-    solana_votor_messages::{
-        consensus_message::{ConsensusMessage, VoteMessage},
-        reward_certificate::AddVoteMessage,
-        vote::Vote,
-    },
-    std::{collections::HashMap, sync::atomic::Ordering, time::Instant},
-    thiserror::Error,
+    std::{collections::HashMap, time::Instant},
 };
-
-#[derive(Debug, Error)]
-#[allow(clippy::enum_variant_names)]
-pub(super) enum Error {
-    #[error("channel to consensus pool disconnected")]
-    ConsensusPoolChannelDisconnected,
-    #[error("channel to rewards container disconnected")]
-    RewardsChannelDisconnected,
-    #[error("channel to repair disconnected")]
-    RepairChannelDisconnected,
-    #[error("channel to metrics disconnected")]
-    MetricsChannelDisconnected,
-}
 
 #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
 #[derive(Clone, Debug)]
 pub(super) struct VoteToVerify {
     pub vote_message: VoteMessage,
-    pub bls_pubkey: BlsPubkey,
+    pub bls_pubkey: BlsPubkeyAffine,
     pub pubkey: Pubkey,
 }
 
@@ -71,7 +56,6 @@ impl VoteToVerify {
 pub(super) fn verify_and_send_votes(
     votes_to_verify: Vec<VoteToVerify>,
     root_bank: &Bank,
-    stats: &BLSSigVerifierStats,
     cluster_info: &ClusterInfo,
     leader_schedule: &LeaderScheduleCache,
     channel_to_pool: &Sender<Vec<ConsensusMessage>>,
@@ -79,20 +63,15 @@ pub(super) fn verify_and_send_votes(
     channel_to_reward: &Sender<AddVoteMessage>,
     channel_to_metrics: &ConsensusMetricsEventSender,
     last_voted_slots: &mut HashMap<Pubkey, Slot>,
-) -> Result<Vec<VoteToVerify>, Error> {
+) -> Result<(Vec<VoteToVerify>, SigVerifyVoteStats), SigVerifyVoteError> {
+    let mut measure = Measure::start("verify_and_send_votes");
+    let mut stats = SigVerifyVoteStats::default();
     if votes_to_verify.is_empty() {
-        return Ok(votes_to_verify);
+        return Ok((votes_to_verify, stats));
     }
-    stats
-        .votes_to_verify
-        .fetch_add(votes_to_verify.len() as u64, Ordering::Relaxed);
-    stats
-        .votes_to_verify_batches
-        .fetch_add(1, Ordering::Relaxed);
-    let verified_votes = verify_votes(votes_to_verify, stats);
-    stats
-        .verified_votes
-        .fetch_add(verified_votes.len() as u64, Ordering::Relaxed);
+    stats.votes_to_sig_verify += votes_to_verify.len() as u64;
+    let verified_votes = verify_votes(votes_to_verify, &mut stats);
+    stats.sig_verified_votes += verified_votes.len() as u64;
 
     let (votes_for_pool, msgs_for_repair, msg_for_reward, msg_for_metrics) = process_verified_votes(
         &verified_votes,
@@ -102,14 +81,21 @@ pub(super) fn verify_and_send_votes(
         last_voted_slots,
     );
 
-    send_votes_to_pool(votes_for_pool, channel_to_pool, stats)?;
-    send_votes_to_repair(msgs_for_repair, channel_to_repair, stats)?;
-    send_votes_to_rewards(msg_for_reward, channel_to_reward, stats)?;
-    send_votes_to_metrics(msg_for_metrics, channel_to_metrics, stats)?;
+    send_votes_to_pool(votes_for_pool, channel_to_pool, &mut stats)?;
+    send_votes_to_repair(msgs_for_repair, channel_to_repair, &mut stats)?;
+    send_votes_to_rewards(msg_for_reward, channel_to_reward, &mut stats)?;
+    send_votes_to_metrics(msg_for_metrics, channel_to_metrics, &mut stats)?;
 
-    Ok(verified_votes)
+    measure.stop();
+    stats
+        .fn_verify_and_send_votes_stats
+        .increment(measure.as_us())
+        .unwrap();
+    Ok((verified_votes, stats))
 }
 
+/// If the vote is relevant to repair, then adds it to the [`msgs_for_repair`] so it can eventually
+/// be sent to repair.
 fn inspect_for_repair(
     vote: &VoteToVerify,
     last_voted_slots: &mut HashMap<Pubkey, Slot>,
@@ -188,94 +174,82 @@ fn process_verified_votes(
 fn send_votes_to_metrics(
     votes: Vec<ConsensusMetricsEvent>,
     channel: &ConsensusMetricsEventSender,
-    stats: &BLSSigVerifierStats,
-) -> Result<(), Error> {
+    stats: &mut SigVerifyVoteStats,
+) -> Result<(), SigVerifyVoteError> {
     let len = votes.len();
     let msg = (Instant::now(), votes);
     match channel.try_send(msg) {
         Ok(()) => {
-            stats
-                .verify_votes_metrics_sent
-                .fetch_add(len as u64, Ordering::Relaxed);
+            stats.metrics_sent += len as u64;
             Ok(())
         }
         Err(TrySendError::Full(_)) => {
-            stats
-                .verify_votes_metrics_channel_full
-                .fetch_add(1, Ordering::Relaxed);
+            stats.metrics_channel_full += 1;
             Ok(())
         }
-        Err(TrySendError::Disconnected(_)) => Err(Error::MetricsChannelDisconnected),
+        Err(TrySendError::Disconnected(_)) => Err(SigVerifyVoteError::MetricsChannelDisconnected),
     }
 }
 
 fn send_votes_to_rewards(
     msg: AddVoteMessage,
     channel: &Sender<AddVoteMessage>,
-    stats: &BLSSigVerifierStats,
-) -> Result<(), Error> {
+    stats: &mut SigVerifyVoteStats,
+) -> Result<(), SigVerifyVoteError> {
     let len = msg.votes.len();
     match channel.try_send(msg) {
         Ok(()) => {
-            stats
-                .verify_votes_rewards_sent
-                .fetch_add(len as u64, Ordering::Relaxed);
+            stats.rewards_sent += len as u64;
             Ok(())
         }
         Err(TrySendError::Full(_)) => {
-            stats
-                .verify_votes_rewards_channel_full
-                .fetch_add(1, Ordering::Relaxed);
+            stats.rewards_channel_full += 1;
             Ok(())
         }
-        Err(TrySendError::Disconnected(_)) => Err(Error::RewardsChannelDisconnected),
+        Err(TrySendError::Disconnected(_)) => Err(SigVerifyVoteError::RewardsChannelDisconnected),
     }
 }
 
 fn send_votes_to_pool(
     votes: Vec<ConsensusMessage>,
     channel: &Sender<Vec<ConsensusMessage>>,
-    stats: &BLSSigVerifierStats,
-) -> Result<(), Error> {
+    stats: &mut SigVerifyVoteStats,
+) -> Result<(), SigVerifyVoteError> {
     let len = votes.len();
     if len == 0 {
         return Ok(());
     }
     match channel.try_send(votes) {
         Ok(()) => {
-            stats
-                .verify_votes_consensus_sent
-                .fetch_add(len as u64, Ordering::Relaxed);
+            stats.pool_sent += len as u64;
             Ok(())
         }
         Err(TrySendError::Full(_)) => {
-            stats
-                .verify_votes_consensus_channel_full
-                .fetch_add(1, Ordering::Relaxed);
+            stats.pool_channel_full += 1;
             Ok(())
         }
-        Err(TrySendError::Disconnected(_)) => Err(Error::ConsensusPoolChannelDisconnected),
+        Err(TrySendError::Disconnected(_)) => {
+            Err(SigVerifyVoteError::ConsensusPoolChannelDisconnected)
+        }
     }
 }
 
 fn send_votes_to_repair(
     votes: HashMap<Pubkey, Vec<Slot>>,
     channel: &VerifiedVoteSender,
-    stats: &BLSSigVerifierStats,
-) -> Result<(), Error> {
+    stats: &mut SigVerifyVoteStats,
+) -> Result<(), SigVerifyVoteError> {
     for (pubkey, slots) in votes {
         match channel.try_send((pubkey, slots)) {
             Ok(()) => {
-                stats
-                    .verify_votes_repair_sent
-                    .fetch_add(1, Ordering::Relaxed);
+                stats.repair_sent += 1;
             }
             Err(TrySendError::Full(_)) => {
-                stats
-                    .verify_votes_repair_channel_full
-                    .fetch_add(1, Ordering::Relaxed);
+                stats.repair_channel_full += 1;
             }
-            Err(TrySendError::Disconnected(_)) => return Err(Error::RepairChannelDisconnected),
+            Err(TrySendError::Disconnected(_)) => {
+                return Err(SigVerifyVoteError::RepairChannelDisconnected)
+            }
         }
     }
     Ok(())
@@ -283,7 +257,7 @@ fn send_votes_to_repair(
 
 fn verify_votes(
     votes_to_verify: Vec<VoteToVerify>,
-    stats: &BLSSigVerifierStats,
+    stats: &mut SigVerifyVoteStats,
 ) -> Vec<VoteToVerify> {
     // Try optimistic verification - fast to verify, but cannot identify invalid votes
     if verify_votes_optimistic(&votes_to_verify, stats) {
@@ -295,8 +269,11 @@ fn verify_votes(
 }
 
 #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
-fn verify_votes_optimistic(votes_to_verify: &[VoteToVerify], stats: &BLSSigVerifierStats) -> bool {
-    let mut votes_batch_optimistic_time = Measure::start("votes_batch_optimistic");
+fn verify_votes_optimistic(
+    votes_to_verify: &[VoteToVerify],
+    stats: &mut SigVerifyVoteStats,
+) -> bool {
+    let mut measure = Measure::start("verify_votes_optimistic");
 
     // For BLS verification, minimizing the expensive pairing operation is key.
     // Each BLS signature verification requires two pairings.
@@ -307,6 +284,9 @@ fn verify_votes_optimistic(votes_to_verify: &[VoteToVerify], stats: &BLSSigVerif
     //
     // By verifying the aggregated signature against the aggregated public keys,
     // the number of pairings required is reduced to (1 + number of distinct messages).
+    //
+    // Assuming that sigverifier's dedicated thread pool was used to call this function, the
+    // following should run on that thread pool.
     let (signature_result, (distinct_payloads, pubkeys_result)) = rayon::join(
         || aggregate_signatures(votes_to_verify),
         || aggregate_pubkeys_by_payload(votes_to_verify, stats),
@@ -329,7 +309,11 @@ fn verify_votes_optimistic(votes_to_verify: &[VoteToVerify], stats: &BLSSigVerif
     } else {
         // if non-unique payload, we need to apply a pairing for each distinct message,
         // which is done inside `par_verify_distinct_aggregated`.
-        let payload_slices: Vec<&[u8]> = distinct_payloads.iter().map(|p| p.as_slice()).collect();
+        //
+        // Assuming that sigverifier's dedicated thread pool was used to call this function, the
+        // following should run on that thread pool.
+        let payload_slices: Vec<&[u8]> =
+            distinct_payloads.par_iter().map(|p| p.as_slice()).collect();
         SignatureProjective::par_verify_distinct_aggregated(
             &aggregate_pubkeys,
             &aggregate_signature,
@@ -338,14 +322,16 @@ fn verify_votes_optimistic(votes_to_verify: &[VoteToVerify], stats: &BLSSigVerif
         .is_ok()
     };
 
-    votes_batch_optimistic_time.stop();
+    measure.stop();
     stats
-        .votes_batch_optimistic_elapsed_us
-        .fetch_add(votes_batch_optimistic_time.as_us(), Ordering::Relaxed);
-
+        .fn_verify_votes_optimistic_stats
+        .increment(measure.as_us())
+        .unwrap();
     verified
 }
 
+// Assuming that sigverifier's dedicated thread pool was used to call this function, the
+// following should run on that thread pool.
 #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
 fn aggregate_signatures(votes: &[VoteToVerify]) -> Result<SignatureProjective, BlsError> {
     let signatures = votes.par_iter().map(|v| &v.vote_message.signature);
@@ -362,9 +348,9 @@ fn aggregate_signatures(votes: &[VoteToVerify]) -> Result<SignatureProjective, B
 #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
 fn aggregate_pubkeys_by_payload(
     votes: &[VoteToVerify],
-    stats: &BLSSigVerifierStats,
+    stats: &mut SigVerifyVoteStats,
 ) -> (Vec<Vec<u8>>, Result<Vec<PubkeyProjective>, BlsError>) {
-    let mut grouped_votes: HashMap<&Vote, Vec<&BlsPubkey>> = HashMap::new();
+    let mut grouped_votes: HashMap<&Vote, Vec<&BlsPubkeyAffine>> = HashMap::new();
 
     for v in votes {
         grouped_votes
@@ -373,19 +359,19 @@ fn aggregate_pubkeys_by_payload(
             .push(&v.bls_pubkey);
     }
 
-    let distinct_messages = grouped_votes.len();
     stats
-        .votes_batch_distinct_messages_count
-        .fetch_add(distinct_messages as u64, Ordering::Relaxed);
+        .distinct_votes_stats
+        .increment(grouped_votes.len() as u64)
+        .unwrap();
 
+    // Assuming that sigverifier's dedicated thread pool was used to call this function, the
+    // following should run on that thread pool.
     let (distinct_payloads, distinct_pubkeys_results): (Vec<_>, Vec<_>) = grouped_votes
         .into_par_iter()
         .map(|(vote, pubkeys)| {
             (
                 get_vote_payload(vote),
-                // TODO(sam): https://github.com/anza-xyz/alpenglow/issues/708
-                // should improve public key aggregation drastically (more than 80%)
-                PubkeyProjective::par_aggregate(pubkeys.into_par_iter()),
+                PubkeyProjective::aggregate(pubkeys.into_iter()),
             )
         })
         .unzip();
@@ -397,33 +383,22 @@ fn aggregate_pubkeys_by_payload(
 #[cfg_attr(feature = "dev-context-only-utils", qualifiers(pub))]
 fn verify_individual_votes(
     votes_to_verify: Vec<VoteToVerify>,
-    stats: &BLSSigVerifierStats,
+    stats: &mut SigVerifyVoteStats,
 ) -> Vec<VoteToVerify> {
-    let mut votes_batch_parallel_verify_time = Measure::start("votes_batch_parallel_verify");
+    let mut measure = Measure::start("verify_individual_votes");
 
+    // Assuming that sigverifier's dedicated thread pool was used to call this function, the
+    // following should run on that thread pool.
     let verified_votes: Vec<VoteToVerify> = votes_to_verify
         .into_par_iter()
-        .filter_map(|vote| {
-            // verify signature
-            if !vote.verify() {
-                // if fail, record stats and return `None`
-                stats
-                    .received_bad_signature_votes
-                    .fetch_add(1, Ordering::Relaxed);
-                return None;
-            }
-            // if success, return `VoteToVerify` to provide to `Sender`s
-            Some(vote)
-        })
+        .filter_map(|vote| vote.verify().then_some(vote))
         .collect();
 
-    votes_batch_parallel_verify_time.stop();
+    measure.stop();
     stats
-        .votes_batch_parallel_verify_count
-        .fetch_add(1, Ordering::Relaxed);
-    stats
-        .votes_batch_parallel_verify_elapsed_us
-        .fetch_add(votes_batch_parallel_verify_time.as_us(), Ordering::Relaxed);
+        .fn_verify_individual_votes_stats
+        .increment(measure.as_us())
+        .unwrap();
     verified_votes
 }
 

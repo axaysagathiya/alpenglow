@@ -65,6 +65,9 @@ use {
     agave_syscalls::{
         create_program_runtime_environment_v1, create_program_runtime_environment_v2,
     },
+    agave_votor_messages::{
+        consensus_message::Certificate, migration::GENESIS_CERTIFICATE_ACCOUNT,
+    },
     ahash::AHashSet,
     dashmap::DashMap,
     log::*,
@@ -163,9 +166,6 @@ use {
     solana_transaction_context::{transaction_accounts::TransactionAccount, TransactionReturnData},
     solana_transaction_error::{TransactionError, TransactionResult as Result},
     solana_vote::vote_account::{VoteAccount, VoteAccountsHashMap},
-    solana_votor_messages::{
-        consensus_message::Certificate, migration::GENESIS_CERTIFICATE_ACCOUNT,
-    },
     std::{
         collections::{HashMap, HashSet},
         fmt,
@@ -5143,7 +5143,7 @@ impl Bank {
         let stake = cert_verify::verify_certificate(cert, key_to_rank_map.len(), |rank| {
             key_to_rank_map
                 .get_pubkey_and_stake(rank)
-                .map(|(_, bls_pubkey, stake)| (*stake, *bls_pubkey))
+                .map(|entry| (entry.stake, entry.bls_pubkey))
         })?;
 
         Ok((stake, total_stake))

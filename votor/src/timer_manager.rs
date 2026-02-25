@@ -9,10 +9,10 @@ use {
         common::{DELTA_BLOCK, DELTA_TIMEOUT},
         event::VotorEvent,
     },
+    agave_votor_messages::migration::MigrationStatus,
     crossbeam_channel::Sender,
     parking_lot::RwLock as PlRwLock,
     solana_clock::Slot,
-    solana_votor_messages::migration::MigrationStatus,
     std::{
         sync::{
             atomic::{AtomicBool, Ordering},
@@ -64,8 +64,10 @@ impl TimerManager {
         Self { timers, handle }
     }
 
-    pub(crate) fn set_timeouts(&self, slot: Slot) {
-        self.timers.write().set_timeouts(slot, Instant::now());
+    pub(crate) fn set_timeouts(&self, slot: Slot, standstill_slot: Option<Slot>) {
+        self.timers
+            .write()
+            .set_timeouts(slot, Instant::now(), standstill_slot);
     }
 
     pub(crate) fn join(self) {
@@ -93,7 +95,7 @@ mod tests {
         );
         let slot = 52;
         let start = Instant::now();
-        timer_manager.set_timeouts(slot);
+        timer_manager.set_timeouts(slot, None);
         // Should see two timeouts at DELTA_BLOCK and DELTA_TIMEOUT
         let mut timeouts_received = 0;
         while timeouts_received < 2 && Instant::now().duration_since(start) < Duration::from_secs(2)
