@@ -4,9 +4,9 @@ use {
         perf::{set_perf_stats, PerfMetric, PerfStatsLevel},
         PerfContext,
     },
+    solana_clock::Slot,
     solana_metrics::datapoint_info,
     solana_time_utils::timestamp,
-    solana_clock::Slot,
     std::{
         cell::RefCell,
         fmt::Debug,

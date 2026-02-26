@@ -280,7 +280,11 @@ impl std::ops::DerefMut for ProgressMap {
 impl ProgressMap {
     pub fn insert(&mut self, slot: Slot, fork_progress: ForkProgress) {
         let num_bank_switches = self.get_num_bank_switches(slot);
-        fork_progress.replay_stats.write().unwrap().num_bank_switches = num_bank_switches;
+        fork_progress
+            .replay_stats
+            .write()
+            .unwrap()
+            .num_bank_switches = num_bank_switches;
         self.progress_map.insert(slot, fork_progress);
     }
 
