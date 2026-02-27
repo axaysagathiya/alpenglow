@@ -320,10 +320,6 @@ impl ProgressMap {
         self.bank_switch_counts.get(&slot).cloned().unwrap_or(0)
     }
 
-    pub fn clear_num_bank_switches(&mut self, slot: Slot) {
-        self.bank_switch_counts.remove(&slot);
-    }
-
     pub fn get_fork_stats_mut(&mut self, slot: Slot) -> Option<&mut ForkStats> {
         self.progress_map
             .get_mut(&slot)

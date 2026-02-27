@@ -1,5 +1,5 @@
 use {
-    crate::blockstore_options::LedgerColumnOptions,
+    crate::{blockstore_meta::BlockLocation, blockstore_options::LedgerColumnOptions},
     rocksdb::{
         perf::{set_perf_stats, PerfMetric, PerfStatsLevel},
         PerfContext,
@@ -53,9 +53,10 @@ pub struct BlockstoreSwitchBankMetrics {
 }
 
 impl BlockstoreSwitchBankMetrics {
-    pub fn report_metrics(&self, slot: Slot) {
+    pub fn report_metrics(self, slot: Slot, from_location: BlockLocation) {
         datapoint_info!(
             "blockstore_switch_bank",
+            "from_location" => from_location.to_string(),
             ("slot", slot as i64, i64),
             ("total_elapsed_us", self.total_elapsed_us as i64, i64),
             ("lock_elapsed_us", self.lock_elapsed_us as i64, i64),

@@ -2072,7 +2072,7 @@ impl Blockstore {
         total_measure.stop();
         metrics.total_elapsed_us = total_measure.as_us();
 
-        metrics.report_metrics(slot);
+        metrics.report_metrics(slot, from_location);
     }
 
     // Bypasses erasure recovery becuase it is called from broadcast stage
